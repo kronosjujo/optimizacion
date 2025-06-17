@@ -1,4 +1,5 @@
-# optimizacion
+# Modelo matemático de optimización por etapas
+
 Modelo Matemático de Optimización para ILE
 
 Asegurarse instalar:
