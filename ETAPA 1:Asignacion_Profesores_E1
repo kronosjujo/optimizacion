@@ -306,7 +306,7 @@ class AsignacionProfesores:
     def _exportar_excel(self, df_resultados: pd.DataFrame):
         """Exporta los resultados a un archivo Excel."""
         try:
-            nombre_archivo = "asignacion_etapa1_resultado.xlsx"
+            nombre_archivo = "asignación_profesores_E1.xlsx"
             df_resultados.to_excel(nombre_archivo, index=False)
             print(f"\n💾 ¡Resultados exportados a '{nombre_archivo}'!")
         except Exception as e:
