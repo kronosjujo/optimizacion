@@ -1,0 +1,359 @@
+# Codigo_Etapa3_Final
+import pandas as pd
+import pulp
+from pulp import LpProblem, LpVariable, lpSum, LpMinimize, LpStatus, PULP_CBC_CMD
+from collections import defaultdict
+import time
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple, Set
+import warnings
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('asignacion_libros.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class LibroAssignmentOptimizer:
+    """Clase para optimizar la asignación de libros digitales con límite por horario."""
+    
+    def __init__(self, limite_simultaneo: int = 4):
+        self.limite_simultaneo = limite_simultaneo
+        self.df_etapa1 = None
+        self.C = None  # Clases
+        self.B = None  # Libros
+        self.M = None  # Módulos
+        self.H = None  # Horarios
+        self.clase_info = {}
+        self.IsCompatible = {}
+        self.modulos_por_libro = {
+            "Libro 1": {"B1", "B2"}, "Libro 2": {"B1", "B2"}, "Libro 3": {"B1", "B2"},
+            "Libro 4": {"B3", "B4"}, "Libro 5": {"B3", "B4"},
+            "Libro 6": {"B5", "I1"},
+            "Libro 7": {"I2", "I3"},
+            "Libro 8": {"I4", "A1"}, "Libro 9": {"I4", "A1"},
+            "Libro 10": {"A2", "A3"},
+            "Libro 11": {"A4"}
+        }
+        
+    def cargar_datos(self, archivo: str = "asignacion_etapa1_output.xlsx") -> bool:
+        """Carga y valida los datos de la etapa 1."""
+        try:
+            logger.info(f"Cargando datos desde {archivo}...")
+            
+            if not Path(archivo).exists():
+                logger.error(f"Archivo {archivo} no encontrado.")
+                return False
+            
+            self.df_etapa1 = pd.read_excel(archivo)
+            
+            # Validar columnas requeridas
+            required_cols = ['Profesor', 'Modulo', 'Horario', 'Paralelo', 'Clase_ID']
+            missing_cols = [col for col in required_cols if col not in self.df_etapa1.columns]
+            
+            if missing_cols:
+                logger.error(f"Faltan columnas esenciales: {missing_cols}")
+                return False
+            
+            # Limpiar datos
+            initial_rows = len(self.df_etapa1)
+            self.df_etapa1.dropna(subset=['Modulo', 'Horario'], inplace=True)
+            self.df_etapa1['Horario'] = self.df_etapa1['Horario'].astype(str).str.strip()
+            
+            rows_removed = initial_rows - len(self.df_etapa1)
+            if rows_removed > 0:
+                logger.warning(f"Se removieron {rows_removed} filas con datos faltantes.")
+            
+            if self.df_etapa1.empty:
+                logger.error("No hay datos válidos después de la limpieza.")
+                return False
+            
+            logger.info(f"Datos cargados correctamente: {len(self.df_etapa1)} clases.")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error al cargar datos: {e}")
+            return False
+    
+    def definir_conjuntos(self) -> None:
+        """Define los conjuntos y parámetros del problema."""
+        logger.info("Definiendo conjuntos y parámetros...")
+        
+        # Definir clases
+        if 'Clase_ID' in self.df_etapa1.columns and self.df_etapa1['Clase_ID'].is_unique:
+            logger.info("Usando 'Clase_ID' como identificador único.")
+            self.C = self.df_etapa1['Clase_ID'].tolist()
+            self.clase_info = self.df_etapa1.set_index('Clase_ID').to_dict('index')
+        else:
+            logger.warning("Usando índice de fila como ID de clase.")
+            self.C = self.df_etapa1.index.tolist()
+            self.clase_info = self.df_etapa1.to_dict('index')
+        
+        # Definir otros conjuntos
+        self.B = [f"Libro {i}" for i in range(1, 12)]
+        self.M = self.df_etapa1['Modulo'].unique().tolist()
+        self.H = self.df_etapa1['Horario'].unique().tolist()
+        
+        # Calcular compatibilidad
+        self._calcular_compatibilidad()
+        
+        logger.info(f"Conjuntos definidos - Clases: {len(self.C)}, Libros: {len(self.B)}, "
+                   f"Módulos: {len(self.M)}, Horarios: {len(self.H)}")
+    
+    def _calcular_compatibilidad(self) -> None:
+        """Calcula la matriz de compatibilidad libro-clase."""
+        self.IsCompatible = {}
+        
+        for c in self.C:
+            if c not in self.clase_info:
+                logger.error(f"Clase {c} no encontrada en clase_info.")
+                raise KeyError(f"Clase {c} no encontrada")
+            
+            modulo_c = self.clase_info[c]['Modulo']
+            for b in self.B:
+                self.IsCompatible[b, c] = 1 if modulo_c in self.modulos_por_libro.get(b, set()) else 0
+    
+    def crear_modelo(self) -> LpProblem:
+        """Crea el modelo de optimización."""
+        logger.info(f"Creando modelo con límite {self.limite_simultaneo} por horario...")
+        
+        # Crear problema
+        prob = LpProblem("Asignacion_Libros_Optimizada", LpMinimize)
+        
+        # Variables de decisión
+        x = LpVariable.dicts("AsignacionLibro", 
+                           [(c, b) for c in self.C for b in self.B], 
+                           cat='Binary')
+        u = LpVariable.dicts("UsoLibro", self.B, cat='Binary')
+        
+        # Función objetivo
+        prob += lpSum(u[b] for b in self.B), "Minimizar_Libros_Usados"
+        
+        # Restricciones
+        self._agregar_restricciones(prob, x, u)
+        
+        return prob, x, u
+    
+    def _agregar_restricciones(self, prob: LpProblem, x, u) -> None:
+        """Agrega todas las restricciones al modelo."""
+        logger.info("Agregando restricciones...")
+        
+        restricciones_count = 0
+        
+        # R1: Asignación única por clase
+        for c in self.C:
+            prob += lpSum(x[c, b] for b in self.B) == 1, f"AsignacionUnica_{c}"
+            restricciones_count += 1
+        
+        # R2: Compatibilidad
+        for c in self.C:
+            for b in self.B:
+                if self.IsCompatible[b, c] == 0:
+                    prob += x[c, b] == 0, f"Compatibilidad_{c}_{b}"
+                    restricciones_count += 1
+        
+        # R3: Límite por libro y horario
+        r3_count = 0
+        for b in self.B:
+            for h in self.H:
+                clases_horario = [c for c in self.C 
+                                if self.clase_info[c]['Horario'] == h 
+                                and self.IsCompatible[b, c] == 1]
+                
+                if clases_horario:
+                    prob += (lpSum(x[c, b] for c in clases_horario) <= self.limite_simultaneo,
+                           f"LimiteUsoSimultaneo_{b.replace(' ', '')}_{h.replace(':', '').replace('-', '')}")
+                    r3_count += 1
+        
+        # R4: Activación de uso de libro
+        for b in self.B:
+            prob += lpSum(x[c, b] for c in self.C) <= len(self.C) * u[b], f"ActivarUso_{b}"
+            restricciones_count += 1
+        
+        logger.info(f"Restricciones agregadas - Total: {restricciones_count}, "
+                   f"Límite simultáneo: {r3_count}")
+    
+    def resolver_modelo(self, prob: LpProblem, time_limit: int = 300) -> bool:
+        """Resuelve el modelo de optimización."""
+        logger.info("Resolviendo modelo...")
+        
+        # Configurar solver con límite de tiempo
+        solver = PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+        
+        start_time = time.time()
+        prob.solve(solver)
+        solve_time = time.time() - start_time
+        
+        status_text = LpStatus[prob.status]
+        logger.info(f"Tiempo de resolución: {solve_time:.2f} segundos")
+        logger.info(f"Estado: {status_text}")
+        
+        return prob.status == pulp.LpStatusOptimal
+    
+    def extraer_resultados(self, prob: LpProblem, x, u) -> pd.DataFrame:
+        """Extrae y procesa los resultados de la optimización."""
+        logger.info("Extrayendo resultados...")
+        
+        # Calcular estadísticas
+        libros_usados = sum(1 for b in self.B 
+                          if hasattr(u[b], 'varValue') and u[b].varValue and u[b].varValue > 0.5)
+        
+        logger.info(f"Libros utilizados: {libros_usados}")
+        
+        # Extraer asignaciones
+        resultados = []
+        asignaciones_por_horario = defaultdict(lambda: defaultdict(list))
+        
+        for c in self.C:
+            libro_asignado = None
+            for b in self.B:
+                if (hasattr(x[c, b], 'varValue') and x[c, b].varValue and 
+                    x[c, b].varValue > 0.5):
+                    libro_asignado = b
+                    break
+            
+            if libro_asignado:
+                info = self.clase_info[c]
+                horario = info['Horario']
+                asignaciones_por_horario[libro_asignado][horario].append(c)
+                
+                resultados.append({
+                    "Clase_ID": c,
+                    "Profesor": info.get('Profesor', 'N/A'),
+                    "Modulo": info.get('Modulo', 'N/A'),
+                    "Horario": horario,
+                    "Paralelo": info.get('Paralelo', 'N/A'),
+                    "Libro_Asignado": libro_asignado
+                })
+            else:
+                logger.warning(f"No se pudo asignar libro a la clase {c}")
+        
+        # Verificar límites
+        self._verificar_limites(asignaciones_por_horario)
+        
+        df_resultados = pd.DataFrame(resultados)
+        if not df_resultados.empty:
+            df_resultados.sort_values(by=["Modulo", "Horario", "Profesor"], inplace=True)
+        
+        return df_resultados
+    
+    def _verificar_limites(self, asignaciones: Dict) -> None:
+        """Verifica que se respeten los límites de uso simultáneo."""
+        logger.info(f"Verificando límites de uso simultáneo (<= {self.limite_simultaneo})...")
+        
+        violaciones = []
+        max_uso = 0
+        
+        for libro, horarios in asignaciones.items():
+            for horario, clases in horarios.items():
+                uso_simultaneo = len(clases)
+                max_uso = max(max_uso, uso_simultaneo)
+                
+                if uso_simultaneo > self.limite_simultaneo:
+                    violaciones.append({
+                        'libro': libro,
+                        'horario': horario,
+                        'uso': uso_simultaneo,
+                        'clases': clases
+                    })
+        
+        if violaciones:
+            logger.error("¡VIOLACIONES ENCONTRADAS!")
+            for v in violaciones:
+                logger.error(f"  {v['libro']} en {v['horario']}: {v['uso']} usos > {self.limite_simultaneo}")
+        else:
+            logger.info(f"No hay violaciones. Uso máximo: {max_uso}")
+    
+    def exportar_resultados(self, df_resultados: pd.DataFrame, 
+                          archivo: str = "asignacion_libros_optimizada.xlsx") -> bool:
+        """Exporta los resultados a Excel."""
+        try:
+            df_resultados.to_excel(archivo, index=False)
+            logger.info(f"Resultados exportados a '{archivo}'")
+            return True
+        except Exception as e:
+            logger.error(f"Error al exportar: {e}")
+            return False
+    
+    def ejecutar_optimizacion(self, archivo_entrada: str = "asignación_profesores_E1.xlsx",
+                            archivo_salida: str = "asignación_libros_E3.xlsx") -> bool:
+        """Ejecuta el proceso completo de optimización."""
+        logger.info("=== INICIANDO OPTIMIZACIÓN DE ASIGNACIÓN DE LIBROS ===")
+        start_time = time.time()
+        
+        try:
+            # 1. Cargar datos
+            if not self.cargar_datos(archivo_entrada):
+                return False
+            
+            # 2. Definir conjuntos
+            self.definir_conjuntos()
+            
+            # 3. Crear modelo
+            prob, x, u = self.crear_modelo()
+            
+            # 4. Resolver
+            if not self.resolver_modelo(prob):
+                logger.error("No se encontró solución óptima")
+                return False
+            
+            # 5. Extraer resultados
+            df_resultados = self.extraer_resultados(prob, x, u)
+            
+            # 6. Exportar
+            if not self.exportar_resultados(df_resultados, archivo_salida):
+                return False
+            
+            # 7. Mostrar resumen
+            self._mostrar_resumen(df_resultados, time.time() - start_time)
+            
+            logger.info("=== OPTIMIZACIÓN COMPLETADA EXITOSAMENTE ===")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error durante la optimización: {e}")
+            return False
+    
+    def _mostrar_resumen(self, df_resultados: pd.DataFrame, tiempo_total: float) -> None:
+        """Muestra un resumen de los resultados."""
+        logger.info(f"\n{'='*60}")
+        logger.info("RESUMEN DE RESULTADOS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Tiempo total: {tiempo_total:.2f} segundos")
+        logger.info(f"Clases asignadas: {len(df_resultados)}")
+        logger.info(f"Libros únicos utilizados: {df_resultados['Libro_Asignado'].nunique()}")
+        logger.info(f"Límite por horario: {self.limite_simultaneo}")
+        
+        # Distribución por libro
+        distribucion = df_resultados['Libro_Asignado'].value_counts().sort_index()
+        logger.info("\nDistribución por libro:")
+        for libro, count in distribucion.items():
+            logger.info(f"  {libro}: {count} asignaciones")
+
+
+def main():
+    """Función principal."""
+    # Suprimir warnings de pandas para una salida más limpia
+    warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+    
+    # Crear optimizador
+    optimizer = LibroAssignmentOptimizer(limite_simultaneo=4)
+    
+    # Ejecutar optimización
+    success = optimizer.ejecutar_optimizacion()
+    
+    if not success:
+        logger.error("La optimización falló. Ver logs para detalles.")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
